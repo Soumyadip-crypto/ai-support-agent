@@ -1,7 +1,7 @@
 import os
 import json
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -55,7 +55,7 @@ from sentence_transformers import (
 
 from openai import OpenAI
 
-from jose import jwt
+from jose import jwt, JWTError
 
 
 # =========================================================
@@ -64,19 +64,16 @@ from jose import jwt
 
 load_dotenv()
 
-
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )
 
-
 if not SECRET_KEY:
     raise RuntimeError(
         "SECRET_KEY is not configured."
     )
-
 
 if not OPENAI_API_KEY:
     raise RuntimeError(
@@ -108,9 +105,7 @@ limiter = Limiter(
 
 app = FastAPI()
 
-
 app.state.limiter = limiter
-
 
 app.add_exception_handler(
     RateLimitExceeded,
@@ -127,7 +122,6 @@ async def global_exception_handler(
     request: Request,
     exc: Exception
 ):
-
     print(
         f"Unexpected error: {exc}"
     )
@@ -157,7 +151,6 @@ embedding_model = SentenceTransformer(
     "all-MiniLM-L6-v2"
 )
 
-
 reranker = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
@@ -170,7 +163,6 @@ reranker = CrossEncoder(
 chroma_client = chromadb.PersistentClient(
     path="./chroma_db"
 )
-
 
 collection = chroma_client.get_or_create_collection(
     name="support_knowledge"
@@ -198,7 +190,6 @@ def get_db():
 
 ALGORITHM = "HS256"
 
-
 security = HTTPBearer()
 
 
@@ -220,7 +211,7 @@ def get_current_user(
 
         return payload
 
-    except Exception:
+    except JWTError:
 
         raise HTTPException(
             status_code=401,
@@ -279,7 +270,7 @@ class UserCreate(BaseModel):
     password: str = Field(
         ...,
         min_length=6,
-        max_length=100
+        max_length=72
     )
 
     email: EmailStr
@@ -296,7 +287,7 @@ class LoginRequest(BaseModel):
     password: str = Field(
         ...,
         min_length=6,
-        max_length=100
+        max_length=72
     )
 
 
@@ -361,10 +352,35 @@ def home():
 @app.post("/customers")
 def create_customer(
     customer: CustomerCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
 
+    user_id = current_user.get(
+        "user_id"
+    )
+
+    if not user_id:
+
+        raise HTTPException(
+            status_code=401,
+            detail="User ID missing from token."
+        )
+
+    existing_customer = get_customer_for_user(
+        user_id,
+        db
+    )
+
+    if existing_customer:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Customer profile already exists."
+        )
+
     new_customer = models.Customer(
+        user_id=user_id,
         name=customer.name,
         email=str(customer.email)
     )
@@ -617,72 +633,93 @@ def get_customer_orders_api(
 # =========================================================
 
 @app.post("/register")
+@limiter.limit("5/minute")
 def register(
+    request: Request,
     user: UserCreate,
     db: Session = Depends(get_db)
 ):
 
-    existing_user = db.query(
-        models.User
-    ).filter(
-        models.User.username
-        == user.username
-    ).first()
+    try:
 
-    if existing_user:
+        existing_user = db.query(
+            models.User
+        ).filter(
+            models.User.username
+            == user.username
+        ).first()
 
-        raise HTTPException(
-            status_code=400,
-            detail="Username already exists"
+        if existing_user:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Username already exists"
+            )
+
+        existing_email = db.query(
+            models.Customer
+        ).filter(
+            models.Customer.email
+            == str(user.email)
+        ).first()
+
+        if existing_email:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Email already exists"
+            )
+
+        hashed_password = pwd_context.hash(
+            user.password
         )
 
-    existing_email = db.query(
-        models.Customer
-    ).filter(
-        models.Customer.email
-        == str(user.email)
-    ).first()
-
-    if existing_email:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Email already exists"
+        new_user = models.User(
+            username=user.username,
+            password=hashed_password
         )
 
-    hashed_password = pwd_context.hash(
-        user.password
-    )
+        db.add(new_user)
 
-    new_user = models.User(
-        username=user.username,
-        password=hashed_password
-    )
+        db.flush()
 
-    db.add(new_user)
+        new_customer = models.Customer(
+            user_id=new_user.id,
+            name=user.username,
+            email=str(user.email)
+        )
 
-    db.commit()
+        db.add(new_customer)
 
-    db.refresh(new_user)
+        db.commit()
 
-    new_customer = models.Customer(
-        user_id=new_user.id,
-        name=user.username,
-        email=str(user.email)
-    )
+        db.refresh(new_user)
 
-    db.add(new_customer)
+        db.refresh(new_customer)
 
-    db.commit()
+        return {
+            "message": "User registered successfully",
+            "user_id": new_user.id,
+            "customer_id": new_customer.id,
+            "username": new_user.username
+        }
 
-    db.refresh(new_customer)
+    except HTTPException:
 
-    return {
-        "message": "User registered successfully",
-        "user_id": new_user.id,
-        "customer_id": new_customer.id,
-        "username": new_user.username
-    }
+        raise
+
+    except Exception as exc:
+
+        db.rollback()
+
+        print(
+            f"Registration error: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Registration failed."
+        )
 
 
 # =========================================================
@@ -690,8 +727,10 @@ def register(
 # =========================================================
 
 @app.post("/login")
+@limiter.limit("5/minute")
 def login(
-    request: LoginRequest,
+    request: Request,
+    db_request: LoginRequest,
     db: Session = Depends(get_db)
 ):
 
@@ -699,7 +738,7 @@ def login(
         models.User
     ).filter(
         models.User.username
-        == request.username
+        == db_request.username
     ).first()
 
     if not user:
@@ -710,7 +749,7 @@ def login(
         )
 
     if not pwd_context.verify(
-        request.password,
+        db_request.password,
         user.password
     ):
 
@@ -728,7 +767,7 @@ def login(
             "user_id": user.id,
             "username": user.username,
             "exp": (
-                datetime.utcnow()
+                datetime.now(timezone.utc)
                 + access_token_expires
             )
         },
@@ -1031,34 +1070,21 @@ def get_conversation_messages(
 # =========================================================
 
 order_tool = {
-
     "type": "function",
-
     "name": "get_order_details",
-
     "description": (
         "Get details of one of the currently "
         "authenticated customer's orders "
         "using the order ID."
     ),
-
     "parameters": {
-
         "type": "object",
-
         "properties": {
-
             "order_id": {
-
                 "type": "integer",
-
-                "description":
-                    "The ID of the order"
-
+                "description": "The ID of the order"
             }
-
         },
-
         "required": [
             "order_id"
         ]
@@ -1067,55 +1093,38 @@ order_tool = {
 
 
 customer_tool = {
-
     "type": "function",
-
     "name": "get_customer_details",
-
     "description": (
         "Get details of the currently "
         "authenticated customer."
     ),
-
     "parameters": {
-
         "type": "object",
-
         "properties": {},
-
         "required": []
     }
 }
 
 
 customer_orders_tool = {
-
     "type": "function",
-
     "name": "get_customer_orders",
-
     "description": (
         "Get all orders belonging to the "
         "currently authenticated customer."
     ),
-
     "parameters": {
-
         "type": "object",
-
         "properties": {},
-
         "required": []
     }
 }
 
 
 knowledge_tool = {
-
     "type": "function",
-
     "name": "search_knowledge",
-
     "description": (
         "Search the company knowledge base "
         "for policies, shipping information, "
@@ -1123,27 +1132,18 @@ knowledge_tool = {
         "information, and other customer "
         "support information."
     ),
-
     "parameters": {
-
         "type": "object",
-
         "properties": {
-
             "question": {
-
                 "type": "string",
-
                 "description": (
                     "The customer's question "
                     "that should be searched "
                     "in the knowledge base."
                 )
-
             }
-
         },
-
         "required": [
             "question"
         ]
@@ -1196,13 +1196,9 @@ def get_order_details(
         }
 
     return {
-
         "order_id": order.id,
-
         "customer_id": order.customer_id,
-
         "product": order.product,
-
         "status": order.status
     }
 
@@ -1224,11 +1220,8 @@ def get_customer_details(
         }
 
     return {
-
         "customer_id": customer.id,
-
         "name": customer.name,
-
         "email": customer.email
     }
 
@@ -1257,17 +1250,13 @@ def get_customer_orders(
     ).all()
 
     return {
-
         "customer_id": customer.id,
-
         "orders": [
-
             {
                 "order_id": order.id,
                 "product": order.product,
                 "status": order.status
             }
-
             for order in orders
         ]
     }
@@ -1390,38 +1379,26 @@ Important security rules:
     for item in history:
 
         messages.append({
-
             "role": item["role"],
-
             "content": item["content"]
-
         })
 
     response = client.responses.create(
-
         model="gpt-5-mini",
-
         instructions=instructions,
-
         input=messages,
-
         tools=tools
     )
 
     while True:
 
         function_calls = [
-
             item
-
             for item in response.output
-
             if item.type == "function_call"
-
         ]
 
         if not function_calls:
-
             break
 
         messages.extend(
@@ -1439,42 +1416,33 @@ Important security rules:
             if tool_name == "get_order_details":
 
                 result = secure_get_order_details(
-
                     order_id=arguments[
                         "order_id"
                     ],
-
                     user_id=user_id,
-
                     db=db
                 )
 
             elif tool_name == "get_customer_details":
 
                 result = secure_get_customer_details(
-
                     user_id=user_id,
-
                     db=db
                 )
 
             elif tool_name == "get_customer_orders":
 
                 result = secure_get_customer_orders(
-
                     user_id=user_id,
-
                     db=db
                 )
 
             elif tool_name == "search_knowledge":
 
                 result = search_knowledge(
-
                     arguments[
                         "question"
                     ]
-
                 )
 
             else:
@@ -1484,44 +1452,26 @@ Important security rules:
                 }
 
             messages.append({
-
-                "type":
-                    "function_call_output",
-
-                "call_id":
-                    function_call.call_id,
-
-                "output":
-                    json.dumps(result)
-
+                "type": "function_call_output",
+                "call_id": function_call.call_id,
+                "output": json.dumps(result)
             })
 
         response = client.responses.create(
-
             model="gpt-5-mini",
-
             instructions=instructions,
-
             input=messages,
-
             tools=tools
-
         )
 
     final_answer = response.output_text
 
     save_message(
-
         conversation_id=conversation_id,
-
         role="assistant",
-
         content=final_answer,
-
         user_id=user_id,
-
         db=db
-
     )
 
     return final_answer
@@ -1554,21 +1504,14 @@ def test_agent(
         )
 
     return {
-
         "response": run_order_agent(
-
             message=agent_request.message,
-
             conversation_id=(
                 agent_request.conversation_id
             ),
-
             db=db,
-
             user_id=user_id
-
         )
-
     }
 
 
@@ -1599,13 +1542,9 @@ def test_order_tool(
         )
 
     return secure_get_order_details(
-
         order_id=order_id,
-
         user_id=user_id,
-
         db=db
-
     )
 
 
@@ -1614,12 +1553,28 @@ def test_order_tool(
 # =========================================================
 
 @app.post("/chat")
+@limiter.limit("10/minute")
 def chat(
-    request: ChatRequest
+    request: Request,
+    chat_request: ChatRequest,
+    current_user: dict = Depends(
+        get_current_user
+    )
 ):
 
+    user_id = current_user.get(
+        "user_id"
+    )
+
+    if not user_id:
+
+        raise HTTPException(
+            status_code=401,
+            detail="User ID missing from token."
+        )
+
     result = search_knowledge(
-        request.message
+        chat_request.message
     )
 
     return result

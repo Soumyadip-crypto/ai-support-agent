@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir \
     sqlalchemy \
     python-dotenv \
     passlib \
+    bcrypt==4.0.1 \
     python-jose \
     openai \
     slowapi \

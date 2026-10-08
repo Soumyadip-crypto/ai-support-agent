@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir \
     email-validator \
     httpx
 
-RUN pip install --no-cache-dir chromadb sentence-transformers
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch && pip install --no-cache-dir chromadb sentence-transformers
 
 COPY app ./app
 COPY knowledge ./knowledge

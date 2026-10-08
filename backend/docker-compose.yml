@@ -1,0 +1,11 @@
+services:
+  ai-support-agent:
+    build: .
+    container_name: ai-support-agent
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      - ./support.db:/app/support.db
+      - ./chroma_db:/app/chroma_db

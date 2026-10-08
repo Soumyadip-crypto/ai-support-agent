@@ -1,0 +1,9 @@
+Payment Policy
+
+We accept credit cards, debit cards and online payments.
+
+Payment must be completed before an order is shipped.
+
+If a payment fails, the customer can retry using another payment method.
+
+Refunds are processed after the refund request is approved.
